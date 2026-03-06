@@ -11,6 +11,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # ---------- 日志函数 ----------
@@ -35,6 +36,30 @@ check_internet() {
     return 1
   fi
   return 0
+}
+
+# ---------- 下载工具 ----------
+safe_download() {
+  local url="$1"
+  local output="$2"
+  
+  if is_cmd curl; then
+    curl -fsSL "$url" -o "$output"
+  elif is_cmd wget; then
+    # 检查是否是 BusyBox wget
+    if wget --help 2>&1 | grep -q "BusyBox"; then
+      # BusyBox wget
+      wget "$url" -O "$output"
+    else
+      # GNU wget
+      wget -q "$url" -O "$output"
+    fi
+  else
+    log_error "需要 curl 或 wget，请先安装"
+    detect_pm
+    pkg_install curl
+    curl -fsSL "$url" -o "$output"
+  fi
 }
 
 PM=""
@@ -319,7 +344,16 @@ warp_install() {
   require_root
   log_step "开始安装 Warp..."
   check_internet || return 1
-  wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
+  
+  safe_download "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" "menu.sh"
+  
+  if [ -f "menu.sh" ]; then
+    chmod +x menu.sh
+    bash menu.sh
+  else
+    log_error "下载 Warp 脚本失败"
+    return 1
+  fi
 }
 
 warp_menu() {
@@ -328,8 +362,9 @@ warp_menu() {
     read -p "是否现在安装 Warp？[y/N]: " install_warp
     if [[ "$install_warp" =~ ^[Yy]$ ]]; then
       warp_install
+    else
+      return
     fi
-    return
   fi
   
   while true; do
@@ -348,7 +383,7 @@ warp_menu() {
       2) warp 6 ;;
       3) warp d ;;
       4) warp o ;;
-      5) warp status ;;
+      5) warp status 2>/dev/null || echo "Warp 状态不可用" ;;
       6) warp u ;;
       0) break ;;
       *) log_error "无效选择！" ;;
@@ -362,9 +397,15 @@ install_komari() {
   log_step "开始安装 Komari..."
   check_internet || return 1
   
-  curl -fsSL https://raw.githubusercontent.com/komari-monitor/komari/main/install-komari.sh -o install-komari.sh
-  chmod +x install-komari.sh
-  sudo ./install-komari.sh
+  safe_download "https://raw.githubusercontent.com/komari-monitor/komari/main/install-komari.sh" "install-komari.sh"
+  
+  if [ -f "install-komari.sh" ]; then
+    chmod +x install-komari.sh
+    sudo ./install-komari.sh
+  else
+    log_error "下载 Komari 脚本失败"
+    return 1
+  fi
 }
 
 uninstall_komari() {
@@ -381,7 +422,7 @@ uninstall_komari() {
         sudo ./install-komari.sh
       else
         log_warn "未找到 install-komari.sh，正在下载..."
-        curl -fsSL https://raw.githubusercontent.com/komari-monitor/komari/main/install-komari.sh -o install-komari.sh
+        safe_download "https://raw.githubusercontent.com/komari-monitor/komari/main/install-komari.sh" "install-komari.sh"
         chmod +x install-komari.sh
         sudo ./install-komari.sh
       fi
@@ -635,18 +676,22 @@ show_system_info() {
 # ---------- 主菜单 ----------
 main_menu() {
   while true; do
-    echo -e "\n${PURPLE}=== 一键脚本菜单 (sk) ===${NC}"
-    echo "1) 安装 3x-ui"
-    echo "2) 安装 x-ui"
-    echo "3) Caddy 相关"
-    echo "4) Warp 相关"
-    echo "5) Komari 相关"
-    echo "6) 安装 Docker"
-    echo "7) 系统信息"
-    echo "8) 更新脚本"
-    echo "9) 卸载脚本"
-    echo "0) 退出"
-    echo -e "${YELLOW}--------------------------------${NC}"
+    echo -e "\n${PURPLE}╔════════════════════════════════════════╗${NC}"
+    echo -e "${PURPLE}║           ${WHITE}SIKI 一键脚本菜单${PURPLE}           ║${NC}"
+    echo -e "${PURPLE}╠════════════════════════════════════════╣${NC}"
+    echo -e "${PURPLE}║ ${CYAN}1)${NC} 安装 3x-ui                          ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}2)${NC} 安装 x-ui                           ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}3)${NC} Caddy 相关                          ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}4)${NC} Warp 相关                           ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}5)${NC} Komari 相关                         ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}6)${NC} 安装 Docker                         ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}7)${NC} 系统信息                            ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}8)${NC} 更新脚本                            ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}9)${NC} 卸载脚本                            ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║ ${CYAN}0)${NC} 退出                                ${PURPLE}║${NC}"
+    echo -e "${PURPLE}╚════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}GitHub: https://github.com/sikiyz/toolScript${NC}"
+    echo -e "${YELLOW}════════════════════════════════════════════${NC}"
     read -p "请选择 [0-9]: " main_choice
     
     case $main_choice in
@@ -686,9 +731,9 @@ update_script() {
   log_info "已备份当前脚本到: $backup_path"
   
   # 从 GitHub 下载最新版本
-  local github_url="https://raw.githubusercontent.com/sikiyz/toolScript/main/script/sk.sh"
+  local github_url="https://raw.githubusercontent.com/sikiyz/toolScript/main/sk.sh"
   
-  if curl -fsSL "$github_url" -o "$script_path.tmp"; then
+  if safe_download "$github_url" "$script_path.tmp"; then
     # 检查下载的脚本是否有效
     if head -n 5 "$script_path.tmp" | grep -q "sk - 一键多功能脚本菜单"; then
       chmod +x "$script_path.tmp"
@@ -748,7 +793,7 @@ install_to_system() {
   fi
   
   # 下载脚本
-  if curl -fsSL "$script_url" -o "$install_path"; then
+  if safe_download "$script_url" "$install_path"; then
     chmod +x "$install_path"
     log_info "脚本已安装到: $install_path"
     log_info "现在您可以直接输入 'sk' 运行脚本"
@@ -770,11 +815,14 @@ install_to_system() {
     fi
     
     # 显示使用说明
-    echo -e "\n${GREEN}安装完成！${NC}"
+    echo -e "\n${GREEN}╔════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║           ${WHITE}安装完成！${GREEN}                ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
     echo -e "${YELLOW}使用方法:${NC}"
     echo -e "  直接运行: ${CYAN}sk${NC}"
     echo -e "  查看帮助: ${CYAN}sk help${NC}"
     echo -e "  更新脚本: ${CYAN}sk update${NC}"
+    echo -e "${YELLOW}GitHub: https://github.com/sikiyz/toolScript${NC}"
     
   else
     log_error "下载脚本失败"
@@ -787,23 +835,28 @@ install_to_system() {
 show_banner() {
   clear
   echo -e "${PURPLE}"
-  echo "   _____ _    _ __  __ "
-  echo "  / ____| |  | |  \/  |"
-  echo " | (___ | |  | | \  / |"
-  echo "  \___ \| |  | | |\/| |"
-  echo "  ____) | |__| | |  | |"
-  echo " |_____/ \____/|_|  |_|"
+  echo "    ███████╗██╗██╗  ██╗██╗"
+  echo "    ██╔════╝██║██║ ██╔╝██║"
+  echo "    ███████╗██║█████╔╝ ██║"
+  echo "    ╚════██║██║██╔═██╗ ██║"
+  echo "    ███████║██║██║  ██╗██║"
+  echo "    ╚══════╝╚═╝╚═╝  ╚═╝╚═╝"
   echo -e "${NC}"
-  echo -e "${CYAN}        多功能一键脚本${NC}"
-  echo -e "${YELLOW}    GitHub: sikiyz/toolScript${NC}"
-  echo -e "${YELLOW}================================${NC}"
+  echo -e "${CYAN}    ╔══════════════════════════════╗${NC}"
+  echo -e "${CYAN}    ║     ${WHITE}多功能一键脚本 v1.0${CYAN}     ║${NC}"
+  echo -e "${CYAN}    ║   ${WHITE}Created by ${PURPLE}SIKI${WHITE}${CYAN}         ║${NC}"
+  echo -e "${CYAN}    ╚══════════════════════════════╝${NC}"
+  echo -e "${YELLOW}    GitHub: ${WHITE}sikiyz/toolScript${NC}"
+  echo -e "${YELLOW}    ═══════════════════════════════${NC}"
+  echo ""
 }
 
 # 检查是否首次运行
 if [ ! -f "/usr/local/bin/sk" ] && [ "$0" != "/usr/local/bin/sk" ]; then
   show_banner
-  echo -e "\n检测到首次运行，是否安装到系统？"
-  echo -e "安装后可以直接输入 'sk' 运行"
+  echo -e "${CYAN}检测到首次运行，是否安装到系统？${NC}"
+  echo -e "${YELLOW}安装后可以直接输入 'sk' 运行${NC}"
+  echo -e "${YELLOW}══════════════════════════════════${NC}"
   read -p "是否安装？[Y/n]: " install_choice
   
   if [[ "$install_choice" =~ ^[Nn]$ ]]; then
@@ -839,20 +892,27 @@ else
     "uninstall"|"9") uninstall_script ;;
     "install") install_to_system ;;
     "help"|"-h"|"--help")
-      echo "用法: sk [选项]"
-      echo "选项:"
-      echo "  3xui 或 1     安装 3x-ui"
-      echo "  x-ui 或 2     安装 x-ui"
-      echo "  caddy 或 3    Caddy 菜单"
-      echo "  warp 或 4     Warp 菜单"
-      echo "  komari 或 5   Komari 菜单"
-      echo "  docker 或 6   安装 Docker"
-      echo "  info 或 7     系统信息"
-      echo "  update 或 8   更新脚本"
-      echo "  uninstall 或 9 卸载脚本"
-      echo "  install       安装脚本到系统"
-      echo "  help          显示帮助"
-      echo "  无参数        显示主菜单"
+      echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
+      echo -e "${CYAN}║           ${WHITE}SIKI 脚本帮助${CYAN}               ║${NC}"
+      echo -e "${CYAN}╠════════════════════════════════════════╣${NC}"
+      echo -e "${CYAN}║ ${WHITE}用法: sk [选项]${CYAN}                       ║${NC}"
+      echo -e "${CYAN}║                                        ║${NC}"
+      echo -e "${CYAN}║ ${WHITE}选项:${CYAN}                                 ║${NC}"
+      echo -e "${CYAN}║ ${CYAN}3xui 或 1${NC}     安装 3x-ui                 ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}x-ui 或 2${NC}      安装 x-ui                  ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}caddy 或 3${NC}     Caddy 菜单                ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}warp 或 4${NC}      Warp 菜单                 ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}komari 或 5${NC}    Komari 菜单               ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}docker 或 6${NC}    安装 Docker               ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}info 或 7${NC}      系统信息                  ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}update 或 8${NC}    更新脚本                  ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}uninstall 或 9${NC} 卸载脚本                  ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}install${NC}        安装脚本到系统            ${CYAN}║${NC}"
+      echo -e "${CYAN}║ ${CYAN}help${NC}           显示帮助                  ${CYAN}║${NC}"
+      echo -e "${CYAN}║                                        ║${NC}"
+      echo -e "${CYAN}║ ${WHITE}无参数${NC}        显示主菜单                ${CYAN}║${NC}"
+      echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
+      echo -e "${YELLOW}GitHub: https://github.com/sikiyz/toolScript${NC}"
       ;;
     *)
       echo -e "${RED}未知选项: $1${NC}"
