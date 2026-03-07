@@ -25,7 +25,21 @@ is_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    log_error "请使用 root 运行此脚本（sudo -i 或者 su）"
+    log_error "请使用 root 运行此脚本（使用 su 命令切换到 root）"
+    exit 1
+  fi
+}
+
+# 安全的 sudo 函数
+safe_sudo() {
+  if [ "$(id -u)" -eq 0 ]; then
+    # 已经是 root，直接执行
+    "$@"
+  elif is_cmd sudo; then
+    sudo "$@"
+  else
+    log_error "需要 root 权限且未找到 sudo 命令"
+    log_error "请使用 'su' 切换到 root 用户后运行"
     exit 1
   fi
 }
@@ -64,28 +78,46 @@ safe_download() {
 
 PM=""
 detect_pm() {
+  # 检测 Alpine Linux (apk)
+  if is_cmd apk; then PM="apk"; fi
+  # 检测 Debian/Ubuntu (apt)
   if is_cmd apt-get; then PM="apt"; fi
+  # 检测 RHEL/CentOS/Fedora (dnf/yum)
   if is_cmd dnf; then PM="dnf"; fi
   if is_cmd yum && [ -z "$PM" ]; then PM="yum"; fi
+  # 检测 openSUSE (zypper)
   if is_cmd zypper && [ -z "$PM" ]; then PM="zypper"; fi
+  # 检测 Arch Linux (pacman)
   if is_cmd pacman && [ -z "$PM" ]; then PM="pacman"; fi
+  
   if [ -z "$PM" ]; then
-    log_warn "未识别的包管理器"
+    log_warn "未识别的包管理器，可能是 BusyBox 系统"
+    # 尝试检测系统类型
+    if [ -f /etc/alpine-release ]; then
+      PM="apk"
+      log_info "检测到 Alpine Linux，使用 apk 包管理器"
+    elif [ -f /etc/os-release ]; then
+      . /etc/os-release
+      log_warn "系统: $NAME $VERSION"
+    fi
   fi
 }
 
 pkg_update() {
   case "$PM" in
+    apk) apk update ;;
     apt) apt-get update -y ;;
     dnf|yum) $PM makecache ;;
     zypper) zypper refresh ;;
     pacman) pacman -Sy ;;
+    *) log_warn "无法更新包缓存" ;;
   esac
 }
 
 pkg_install() {
   log_step "安装: $*"
   case "$PM" in
+    apk) apk add --no-cache "$@" ;;
     apt)
       DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
       ;;
@@ -93,7 +125,8 @@ pkg_install() {
     zypper) zypper --non-interactive install -y "$@" ;;
     pacman) pacman -Sy --noconfirm "$@" ;;
     *) 
-      log_warn "未识别的包管理器，尝试手动安装"
+      log_error "未识别的包管理器，请手动安装: $*"
+      log_error "系统信息: $(uname -a)"
       return 1
       ;;
   esac
@@ -128,27 +161,6 @@ caddy_arch_map() {
   esac
 }
 
-install_caddy_repo_deb() {
-  pkg_install debian-keyring debian-archive-keyring apt-transport-https curl gnupg
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /etc/apt/keyrings/caddy-stable.gpg
-  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-    | sed 's#deb #[signed-by=/etc/apt/keyrings/caddy-stable.gpg] deb #' \
-    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-  pkg_update
-  pkg_install caddy
-}
-
-install_caddy_repo_rpm() {
-  if is_cmd dnf; then
-    dnf -y install 'dnf-command(copr)' || true
-    dnf -y copr enable @caddy/caddy || true
-    dnf -y install caddy
-  else
-    return 1
-  fi
-}
-
 install_caddy_binary() {
   local arch; arch="$(caddy_arch_map)"
   if [ -z "$arch" ]; then
@@ -156,19 +168,75 @@ install_caddy_binary() {
     return 1
   fi
   
-  pkg_install curl tar ca-certificates || true
+  # 安装依赖（如果可能）
+  if [ "$PM" = "apk" ]; then
+    pkg_install curl tar ca-certificates 2>/dev/null || true
+  else
+    pkg_install curl tar ca-certificates 2>/dev/null || true
+  fi
+  
   mkdir -p /usr/local/bin
   log_step "下载 Caddy 二进制..."
   
-  if ! curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${arch}&id=caddy" | tar -xz -C /usr/local/bin caddy; then
-    log_error "下载失败，尝试备用地址..."
-    curl -fsSL "https://github.com/caddyserver/caddy/releases/latest/download/caddy_linux_${arch}.tar.gz" | tar -xz -C /usr/local/bin caddy
+  # 清理可能的旧文件
+  rm -f /usr/local/bin/caddy /tmp/caddy.tar.gz 2>/dev/null || true
+  
+  # 尝试多个下载源
+  local download_success=false
+  
+  # 尝试源1: caddyserver.com
+  if curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${arch}&id=caddy" -o /tmp/caddy.tar.gz; then
+    if tar -xz -f /tmp/caddy.tar.gz -C /usr/local/bin caddy 2>/dev/null; then
+      download_success=true
+    fi
+  fi
+  
+  # 如果失败，尝试源2: GitHub releases
+  if [ "$download_success" = false ]; then
+    log_warn "尝试备用地址..."
+    rm -f /tmp/caddy.tar.gz 2>/dev/null || true
+    
+    # 获取最新版本号
+    local latest_version=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    
+    if [ -n "$latest_version" ]; then
+      local download_url="https://github.com/caddyserver/caddy/releases/download/${latest_version}/caddy_${latest_version#v}_linux_${arch}.tar.gz"
+      
+      if curl -fsSL "$download_url" -o /tmp/caddy.tar.gz; then
+        if tar -xz -f /tmp/caddy.tar.gz -C /usr/local/bin caddy 2>/dev/null; then
+          download_success=true
+        fi
+      fi
+    fi
+  fi
+  
+  # 如果还是失败，尝试直接下载二进制
+  if [ "$download_success" = false ]; then
+    log_warn "尝试直接下载二进制..."
+    rm -f /tmp/caddy.tar.gz 2>/dev/null || true
+    
+    # 对于 Alpine/BusyBox，可能需要静态编译版本
+    local static_url="https://github.com/caddyserver/caddy/releases/latest/download/caddy_linux_${arch}.tar.gz"
+    
+    if curl -fsSL "$static_url" -o /tmp/caddy.tar.gz; then
+      if tar -xz -f /tmp/caddy.tar.gz -C /usr/local/bin caddy 2>/dev/null; then
+        download_success=true
+      fi
+    fi
+  fi
+  
+  if [ "$download_success" = false ]; then
+    log_error "Caddy 下载失败"
+    log_error "请手动下载: https://caddyserver.com/download"
+    return 1
   fi
   
   chmod +x /usr/local/bin/caddy
+  rm -f /tmp/caddy.tar.gz 2>/dev/null || true
   
-  # 创建 systemd 服务
-  cat > /etc/systemd/system/caddy.service <<EOF
+  # 创建 systemd 服务（如果 systemd 可用）
+  if is_cmd systemctl; then
+    cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy
 Documentation=https://caddyserver.com/docs/
@@ -190,10 +258,16 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
+    
+    mkdir -p /etc/caddy
+    systemctl daemon-reload
+    systemctl enable caddy --now
+  else
+    # 非 systemd 系统
+    log_warn "未找到 systemd，Caddy 需要手动启动"
+    log_info "启动命令: /usr/local/bin/caddy run --config /etc/caddy/Caddyfile"
+  fi
   
-  mkdir -p /etc/caddy
-  systemctl daemon-reload
-  systemctl enable caddy --now
   log_info "Caddy 二进制安装完成！"
 }
 
@@ -202,17 +276,9 @@ install_caddy() {
   detect_pm
   log_step "开始安装 Caddy..."
   
-  if [ "$PM" = "apt" ]; then
-    install_caddy_repo_deb
-  elif [ "$PM" = "dnf" ] || [ "$PM" = "yum" ]; then
-    if ! install_caddy_repo_rpm; then
-      log_warn "RPM 仓库安装失败，尝试二进制安装..."
-      install_caddy_binary
-    fi
-  else
-    log_warn "使用二进制安装..."
-    install_caddy_binary
-  fi
+  # 对于 Alpine Linux 或未知系统，使用二进制安装
+  log_warn "使用二进制安装..."
+  install_caddy_binary
   
   if is_cmd caddy; then
     log_info "Caddy 安装成功！版本: $(caddy version 2>/dev/null || echo '未知')"
@@ -275,18 +341,23 @@ ${domain} {
 }
 EOF
   
-  # 重启 Caddy
-  systemctl restart caddy
-  sleep 2
-  
-  if systemctl is-active --quiet caddy; then
-    log_info "反代配置完成！"
-    echo -e "${YELLOW}域名: ${domain} -> ${upstream}${NC}"
-    echo -e "${YELLOW}Caddy 配置文件: /etc/caddy/Caddyfile${NC}"
-    echo -e "${YELLOW}查看状态: systemctl status caddy${NC}"
+  # 重启 Caddy（如果 systemd 可用）
+  if is_cmd systemctl; then
+    systemctl restart caddy 2>/dev/null || true
+    sleep 2
+    
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+      log_info "反代配置完成！"
+      echo -e "${YELLOW}域名: ${domain} -> ${upstream}${NC}"
+      echo -e "${YELLOW}Caddy 配置文件: /etc/caddy/Caddyfile${NC}"
+      echo -e "${YELLOW}查看状态: systemctl status caddy${NC}"
+    else
+      log_warn "Caddy 启动失败，请手动启动"
+      log_info "启动命令: /usr/local/bin/caddy run --config /etc/caddy/Caddyfile"
+    fi
   else
-    log_error "Caddy 启动失败，请检查配置"
-    journalctl -u caddy --no-pager -n 20
+    log_info "配置已保存到 /etc/caddy/Caddyfile"
+    log_info "请手动启动 Caddy: /usr/local/bin/caddy run --config /etc/caddy/Caddyfile"
   fi
 }
 
@@ -294,24 +365,26 @@ uninstall_caddy() {
   require_root
   log_step "开始卸载 Caddy..."
   
-  systemctl stop caddy 2>/dev/null || true
-  systemctl disable caddy 2>/dev/null || true
-  rm -f /etc/systemd/system/caddy.service
-  systemctl daemon-reload
+  if is_cmd systemctl; then
+    systemctl stop caddy 2>/dev/null || true
+    systemctl disable caddy 2>/dev/null || true
+    rm -f /etc/systemd/system/caddy.service
+    systemctl daemon-reload
+  fi
   
   detect_pm
   case "$PM" in
-    apt) apt-get remove -y caddy ;;
-    dnf) dnf remove -y caddy ;;
-    yum) yum remove -y caddy ;;
-    zypper) zypper remove -y caddy ;;
-    pacman) pacman -R --noconfirm caddy ;;
-    *) 
-      rm -f /usr/local/bin/caddy
-      rm -rf /etc/caddy
-      rm -rf /var/lib/caddy
-      ;;
+    apk) apk del caddy 2>/dev/null || true ;;
+    apt) apt-get remove -y caddy 2>/dev/null || true ;;
+    dnf) dnf remove -y caddy 2>/dev/null || true ;;
+    yum) yum remove -y caddy 2>/dev/null || true ;;
+    zypper) zypper remove -y caddy 2>/dev/null || true ;;
+    pacman) pacman -R --noconfirm caddy 2>/dev/null || true ;;
   esac
+  
+  rm -f /usr/local/bin/caddy 2>/dev/null || true
+  rm -rf /etc/caddy 2>/dev/null || true
+  rm -rf /var/lib/caddy 2>/dev/null || true
   
   log_info "Caddy 卸载完成！"
 }
@@ -330,8 +403,20 @@ caddy_menu() {
     case $caddy_choice in
       1) install_caddy ;;
       2) caddy_reverse_proxy ;;
-      3) systemctl status caddy ;;
-      4) journalctl -u caddy -f ;;
+      3) 
+        if is_cmd systemctl; then
+          systemctl status caddy 2>/dev/null || echo "Caddy 未运行"
+        else
+          echo "Caddy 状态: $(ps aux | grep caddy | grep -v grep || echo '未运行')"
+        fi
+        ;;
+      4) 
+        if is_cmd journalctl; then
+          journalctl -u caddy -f 2>/dev/null || echo "无法查看日志"
+        else
+          echo "无法查看 systemd 日志"
+        fi
+        ;;
       5) uninstall_caddy ;;
       0) break ;;
       *) log_error "无效选择！" ;;
@@ -379,12 +464,12 @@ warp_menu() {
     read -p "请选择 [0-6]: " warp_choice
     
     case $warp_choice in
-      1) warp 4 ;;
-      2) warp 6 ;;
-      3) warp d ;;
-      4) warp o ;;
+      1) warp 4 2>/dev/null || echo "命令执行失败" ;;
+      2) warp 6 2>/dev/null || echo "命令执行失败" ;;
+      3) warp d 2>/dev/null || echo "命令执行失败" ;;
+      4) warp o 2>/dev/null || echo "命令执行失败" ;;
       5) warp status 2>/dev/null || echo "Warp 状态不可用" ;;
-      6) warp u ;;
+      6) warp u 2>/dev/null || echo "命令执行失败" ;;
       0) break ;;
       *) log_error "无效选择！" ;;
     esac
@@ -401,7 +486,15 @@ install_komari() {
   
   if [ -f "install-komari.sh" ]; then
     chmod +x install-komari.sh
-    sudo ./install-komari.sh
+    # 使用安全的执行方式
+    if [ "$(id -u)" -eq 0 ]; then
+      ./install-komari.sh
+    elif is_cmd sudo; then
+      sudo ./install-komari.sh
+    else
+      # 已经是 root 或者没有 sudo，直接执行
+      ./install-komari.sh
+    fi
   else
     log_error "下载 Komari 脚本失败"
     return 1
@@ -419,20 +512,34 @@ uninstall_komari() {
   case $komari_uninstall_choice in
     1)
       if [ -f "install-komari.sh" ]; then
-        sudo ./install-komari.sh
+        if [ "$(id -u)" -eq 0 ]; then
+          ./install-komari.sh
+        elif is_cmd sudo; then
+          sudo ./install-komari.sh
+        else
+          ./install-komari.sh
+        fi
       else
         log_warn "未找到 install-komari.sh，正在下载..."
         safe_download "https://raw.githubusercontent.com/komari-monitor/komari/main/install-komari.sh" "install-komari.sh"
         chmod +x install-komari.sh
-        sudo ./install-komari.sh
+        if [ "$(id -u)" -eq 0 ]; then
+          ./install-komari.sh
+        elif is_cmd sudo; then
+          sudo ./install-komari.sh
+        else
+          ./install-komari.sh
+        fi
       fi
       ;;
     2)
-      sudo systemctl stop komari-agent 2>/dev/null || true
-      sudo systemctl disable komari-agent 2>/dev/null || true
-      sudo rm -f /etc/systemd/system/komari-agent.service
-      sudo systemctl daemon-reload
-      sudo rm -rf /opt/komari/agent /var/log/komari 2>/dev/null || true
+      if is_cmd systemctl; then
+        systemctl stop komari-agent 2>/dev/null || true
+        systemctl disable komari-agent 2>/dev/null || true
+        rm -f /etc/systemd/system/komari-agent.service 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+      fi
+      rm -rf /opt/komari/agent /var/log/komari 2>/dev/null || true
       log_info "Komari Agent 卸载完成！"
       ;;
     *)
@@ -453,7 +560,17 @@ komari_menu() {
     case $komari_choice in
       1) install_komari ;;
       2) uninstall_komari ;;
-      3) systemctl status komari-agent 2>/dev/null || log_warn "Komari Agent 未运行" ;;
+      3) 
+        if is_cmd systemctl; then
+          systemctl status komari-agent 2>/dev/null || log_warn "Komari Agent 未运行"
+        else
+          if ps aux | grep -q "[k]omari-agent"; then
+            echo "Komari Agent 正在运行"
+          else
+            echo "Komari Agent 未运行"
+          fi
+        fi
+        ;;
       0) break ;;
       *) log_error "无效选择！" ;;
     esac
@@ -466,7 +583,7 @@ install_docker() {
   detect_pm
   
   if is_cmd docker; then
-    log_warn "Docker 已安装，版本: $(docker --version)"
+    log_warn "Docker 已安装，版本: $(docker --version 2>/dev/null || echo '未知')"
     read -p "是否重新安装？[y/N]: " reinstall
     [[ "$reinstall" =~ ^[Yy]$ ]] || return
   fi
@@ -475,6 +592,9 @@ install_docker() {
   
   # 卸载旧版本
   case "$PM" in
+    apk)
+      apk del docker docker-engine docker.io containerd runc 2>/dev/null || true
+      ;;
     apt)
       apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
       ;;
@@ -483,125 +603,107 @@ install_docker() {
       ;;
   esac
   
-  # 安装依赖
-  pkg_install apt-transport-https ca-certificates curl gnupg lsb-release
-  
-  # 添加 Docker GPG 密钥
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-  
-  # 添加 Docker 仓库
-  local distro
-  if [ -f /etc/os-release ]; then
-    distro="$(. /etc/os-release && echo "$ID")"
-  else
-    distro="ubuntu"
-  fi
-  
-  # 根据不同的发行版设置仓库
+  # 根据不同的包管理器安装 Docker
   case "$PM" in
+    apk)
+      # Alpine Linux
+      pkg_install docker docker-cli docker-compose
+      rc-update add docker boot
+      service docker start
+      ;;
     apt)
-      # 对于 Debian/Ubuntu 系统
+      # Debian/Ubuntu
+      pkg_install apt-transport-https ca-certificates curl gnupg lsb-release
+      
+      # 添加 Docker GPG 密钥
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      
+      # 添加 Docker 仓库
+      local distro
+      if [ -f /etc/os-release ]; then
+        distro="$(. /etc/os-release && echo "$ID")"
+      else
+        distro="ubuntu"
+      fi
+      
       local codename
       if [ -f /etc/os-release ]; then
         codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
       else
-        codename="$(lsb_release -cs)"
+        codename="$(lsb_release -cs 2>/dev/null || echo "focal")"
       fi
       
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$distro $codename stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-      ;;
-    dnf|yum)
-      # 对于 RHEL/CentOS/Fedora 系统
-      local repo_url="https://download.docker.com/linux/$distro"
-      local gpg_url="https://download.docker.com/linux/$distro/gpg"
+      echo "deb [arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64") signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$distro $codename stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
       
-      # 创建仓库文件
-      cat > /etc/yum.repos.d/docker-ce.repo <<EOF
-[docker-ce-stable]
-name=Docker CE Stable - \$basearch
-baseurl=$repo_url/\$releasever/\$basearch/stable
-enabled=1
-gpgcheck=1
-gpgkey=$gpg_url
-EOF
-      ;;
-    zypper)
-      # 对于 openSUSE/SLES 系统
-      zypper addrepo -f https://download.docker.com/linux/$distro/docker-ce.repo
-      ;;
-    pacman)
-      # 对于 Arch Linux 系统
-      pkg_install docker docker-compose
-      systemctl start docker
-      systemctl enable docker
-      log_info "Docker 安装完成（通过 pacman）"
-      return 0
-      ;;
-  esac
-  
-  # 更新包缓存
-  pkg_update
-  
-  # 安装 Docker
-  case "$PM" in
-    apt)
+      pkg_update
       pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
       ;;
     dnf|yum)
+      # RHEL/CentOS/Fedora
+      pkg_install yum-utils
+      local repo_url="https://download.docker.com/linux/centos/docker-ce.repo"
+      $PM-config-manager --add-repo "$repo_url"
+      pkg_update
       pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose
       ;;
     zypper)
+      # openSUSE/SLES
+      zypper addrepo -f https://download.docker.com/linux/opensuse/docker-ce.repo
+      pkg_update
       pkg_install docker-ce docker-ce-cli containerd.io docker-compose
+      ;;
+    pacman)
+      # Arch Linux
+      pkg_install docker docker-compose
+      ;;
+    *)
+      log_error "不支持的包管理器，尝试通用安装方法..."
+      
+      # 尝试使用通用安装脚本
+      if check_internet; then
+        log_step "使用 Docker 官方安装脚本..."
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh
+        rm -f get-docker.sh
+      else
+        log_error "无法安装 Docker，请手动安装"
+        return 1
+      fi
       ;;
   esac
   
-  # 启动并设置开机自启
-  systemctl start docker
-  systemctl enable docker
+  # 启动 Docker 服务
+  if is_cmd systemctl; then
+    systemctl start docker
+    systemctl enable docker
+  elif [ "$PM" = "apk" ]; then
+    service docker start
+    rc-update add docker boot
+  fi
   
-  # 添加当前用户到 docker 组（如果非root）
+  # 添加当前用户到 docker 组
   if [ "$(id -u)" -eq 0 ] && [ -n "$SUDO_USER" ]; then
     usermod -aG docker "$SUDO_USER"
     log_info "已将用户 $SUDO_USER 添加到 docker 组"
     log_warn "请重新登录或执行 'newgrp docker' 使更改生效"
   elif [ "$(id -u)" -ne 0 ]; then
-    # 如果以非root用户运行，尝试添加到docker组
     if ! groups "$(whoami)" | grep -q docker; then
-      sudo usermod -aG docker "$(whoami)" 2>/dev/null && \
-      log_info "已将当前用户添加到 docker 组" || \
-      log_warn "无法添加用户到 docker 组，请手动执行: sudo usermod -aG docker $(whoami)"
+      if is_cmd sudo; then
+        sudo usermod -aG docker "$(whoami)" 2>/dev/null && \
+        log_info "已将当前用户添加到 docker 组" || \
+        log_warn "无法添加用户到 docker 组"
+      elif [ "$(id -u)" -eq 0 ]; then
+        usermod -aG docker "$(whoami)" 2>/dev/null && \
+        log_info "已将当前用户添加到 docker 组" || \
+        log_warn "无法添加用户到 docker 组"
+      fi
     fi
   fi
   
-  # 配置 Docker 镜像加速（中国用户）
-  if curl -s --connect-timeout 3 https://hub.docker.com >/dev/null; then
-    # 网络正常，不配置镜像加速
-    log_info "Docker Hub 访问正常"
-  else
-    log_warn "Docker Hub 访问较慢，配置镜像加速..."
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json <<EOF
-{
-  "registry-mirrors": [
-    "https://docker.mirrors.ustc.edu.cn",
-    "https://hub-mirror.c.163.com",
-    "https://mirror.baidubce.com"
-  ],
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m"
-  },
-  "storage-driver": "overlay2"
-}
-EOF
-    systemctl restart docker
-  fi
-  
   # 测试安装
-  sleep 2  # 等待 Docker 服务完全启动
+  sleep 2
   
   if docker --version >/dev/null 2>&1; then
     log_info "Docker 安装成功！"
@@ -622,16 +724,10 @@ EOF
       log_info "Docker 测试通过！"
     else
       log_warn "Docker 测试失败，但安装已完成"
-      log_warn "请检查 Docker 服务状态: systemctl status docker"
     fi
-    
-    # 显示 Docker 信息
-    echo -e "\n${CYAN}=== Docker 信息 ===${NC}"
-    docker info 2>/dev/null | grep -E "Server Version:|Containers:|Running:|Paused:|Stopped:|Images:|OSType:|Architecture:" | head -10
     
   else
     log_error "Docker 安装失败！"
-    log_error "请检查日志: journalctl -u docker --no-pager -n 30"
     return 1
   fi
 }
@@ -639,16 +735,38 @@ EOF
 # ---------- 系统信息 ----------
 show_system_info() {
   echo -e "\n${CYAN}=== 系统信息 ===${NC}"
-  echo -e "主机名: $(hostname)"
-  echo -e "系统: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2 2>/dev/null || uname -o)"
+  echo -e "主机名: $(hostname 2>/dev/null || echo '未知')"
+  
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    echo -e "系统: $NAME $VERSION"
+  else
+    echo -e "系统: $(uname -o 2>/dev/null || echo '未知')"
+  fi
+  
   echo -e "内核: $(uname -r)"
   echo -e "架构: $(uname -m)"
-  echo -e "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d':' -f2 | sed 's/^[ \t]*//')"
-  echo -e "内存: $(free -h | awk '/^Mem:/ {print $2}')"
+  
+  if [ -f /proc/cpuinfo ]; then
+    echo -e "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d':' -f2 | sed 's/^[ \t]*//' 2>/dev/null || echo '未知')"
+  fi
+  
+  if is_cmd free; then
+    echo -e "内存: $(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || echo '未知')"
+  fi
   
   # 获取 IP 地址
-  local ipv4=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-  local ipv6=$(ip -6 addr show scope global | grep -oP '(?<=inet6\s)[0-9a-f:]+' | head -1)
+  local ipv4=""
+  local ipv6=""
+  
+  if is_cmd ip; then
+    ipv4=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+' | head -1)
+  elif is_cmd ifconfig; then
+    ipv4=$(ifconfig 2>/dev/null | grep -oP 'inet \K\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+    ipv6=$(ifconfig 2>/dev/null | grep -oP 'inet6 \K[0-9a-f:]+' | grep -v '::1' | head -1)
+  fi
+  
   echo -e "IPv4: ${ipv4:-未检测到}"
   echo -e "IPv6: ${ipv6:-未检测到}"
   
@@ -656,10 +774,14 @@ show_system_info() {
   echo -e "\n${CYAN}=== 已安装服务 ===${NC}"
   local services=("docker" "caddy" "x-ui" "3x-ui" "warp" "komari-agent")
   for service in "${services[@]}"; do
-    if is_cmd "$service" || systemctl is-active --quiet "$service" 2>/dev/null; then
-      echo -e "${GREEN}✓${NC} $service"
-    elif systemctl list-unit-files | grep -q "$service"; then
+    if is_cmd "$service"; then
+      echo -e "${GREEN}✓${NC} $service (命令行可用)"
+    elif is_cmd systemctl && systemctl is-active --quiet "$service" 2>/dev/null; then
+      echo -e "${GREEN}✓${NC} $service (服务运行中)"
+    elif is_cmd systemctl && systemctl list-unit-files 2>/dev/null | grep -q "$service"; then
       echo -e "${YELLOW}○${NC} $service (已安装但未运行)"
+    elif ps aux 2>/dev/null | grep -q "[${service:0:1}]${service:1}"; then
+      echo -e "${GREEN}✓${NC} $service (进程运行中)"
     fi
   done
   
@@ -668,7 +790,7 @@ show_system_info() {
     local container_count=$(docker ps -q 2>/dev/null | wc -l)
     if [ "$container_count" -gt 0 ]; then
       echo -e "\n${CYAN}=== Docker 容器 ===${NC}"
-      docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | head -10
+      docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null | head -10
     fi
   fi
 }
