@@ -361,12 +361,167 @@ EOF
   fi
 }
 
+# Caddy 启动函数
+start_caddy() {
+  require_root
+  if ! is_cmd caddy; then
+    log_error "Caddy 未安装！"
+    return 1
+  fi
+  
+  log_step "启动 Caddy..."
+  
+  if is_cmd systemctl; then
+    if systemctl start caddy 2>/dev/null; then
+      sleep 1
+      if systemctl is-active --quiet caddy 2>/dev/null; then
+        log_info "Caddy 启动成功！"
+      else
+        log_error "Caddy 启动失败！"
+        systemctl status caddy --no-pager -l
+      fi
+    else
+      log_error "systemctl 启动失败"
+    fi
+  else
+    # 非 systemd 系统
+    if pgrep -x "caddy" >/dev/null; then
+      log_warn "Caddy 已经在运行"
+      return 0
+    fi
+    
+    # 检查是否有配置文件
+    if [ ! -f "/etc/caddy/Caddyfile" ]; then
+      log_warn "未找到配置文件 /etc/caddy/Caddyfile"
+      log_info "创建默认配置文件..."
+      mkdir -p /etc/caddy
+      cat > /etc/caddy/Caddyfile <<EOF
+:80 {
+    respond "Caddy is running!"
+}
+EOF
+    fi
+    
+    # 后台启动 Caddy
+    nohup /usr/local/bin/caddy run --config /etc/caddy/Caddyfile > /var/log/caddy.log 2>&1 &
+    
+    sleep 2
+    if pgrep -x "caddy" >/dev/null; then
+      log_info "Caddy 启动成功！"
+      log_info "日志文件: /var/log/caddy.log"
+    else
+      log_error "Caddy 启动失败！"
+      log_info "查看日志: tail -f /var/log/caddy.log"
+    fi
+  fi
+}
+
+# Caddy 停止函数
+stop_caddy() {
+  require_root
+  if ! is_cmd caddy; then
+    log_error "Caddy 未安装！"
+    return 1
+  fi
+  
+  log_step "停止 Caddy..."
+  
+  if is_cmd systemctl; then
+    if systemctl stop caddy 2>/dev/null; then
+      sleep 1
+      if systemctl is-active --quiet caddy 2>/dev/null; then
+        log_error "Caddy 停止失败！"
+      else
+        log_info "Caddy 已停止"
+      fi
+    else
+      log_error "systemctl 停止失败"
+    fi
+  else
+    # 非 systemd 系统
+    if ! pgrep -x "caddy" >/dev/null; then
+      log_warn "Caddy 未在运行"
+      return 0
+    fi
+    
+    pkill -x caddy
+    sleep 2
+    
+    if pgrep -x "caddy" >/dev/null; then
+      log_error "Caddy 停止失败！"
+      log_info "尝试强制停止: pkill -9 caddy"
+    else
+      log_info "Caddy 已停止"
+    fi
+  fi
+}
+
+# Caddy 重启函数
+restart_caddy() {
+  require_root
+  if ! is_cmd caddy; then
+    log_error "Caddy 未安装！"
+    return 1
+  fi
+  
+  log_step "重启 Caddy..."
+  
+  if is_cmd systemctl; then
+    if systemctl restart caddy 2>/dev/null; then
+      sleep 2
+      if systemctl is-active --quiet caddy 2>/dev/null; then
+        log_info "Caddy 重启成功！"
+      else
+        log_error "Caddy 重启失败！"
+        systemctl status caddy --no-pager -l
+      fi
+    else
+      log_error "systemctl 重启失败"
+    fi
+  else
+    # 非 systemd 系统
+    stop_caddy
+    sleep 1
+    start_caddy
+  fi
+}
+
+# Caddy 重载配置
+reload_caddy() {
+  require_root
+  if ! is_cmd caddy; then
+    log_error "Caddy 未安装！"
+    return 1
+  fi
+  
+  log_step "重载 Caddy 配置..."
+  
+  if is_cmd systemctl; then
+    if systemctl reload caddy 2>/dev/null; then
+      log_info "Caddy 配置重载成功！"
+    else
+      log_warn "重载失败，尝试重启..."
+      restart_caddy
+    fi
+  else
+    # 非 systemd 系统，发送信号重载
+    if pgrep -x "caddy" >/dev/null; then
+      pkill -HUP caddy
+      log_info "已发送重载信号给 Caddy"
+    else
+      log_error "Caddy 未在运行"
+    fi
+  fi
+}
+
 uninstall_caddy() {
   require_root
   log_step "开始卸载 Caddy..."
   
+  # 先停止 Caddy
+  stop_caddy
+  
   if is_cmd systemctl; then
-    systemctl stop caddy 2>/dev/null || true
     systemctl disable caddy 2>/dev/null || true
     rm -f /etc/systemd/system/caddy.service
     systemctl daemon-reload
@@ -385,6 +540,7 @@ uninstall_caddy() {
   rm -f /usr/local/bin/caddy 2>/dev/null || true
   rm -rf /etc/caddy 2>/dev/null || true
   rm -rf /var/lib/caddy 2>/dev/null || true
+  rm -f /var/log/caddy.log 2>/dev/null || true
   
   log_info "Caddy 卸载完成！"
 }
@@ -393,31 +549,64 @@ caddy_menu() {
   while true; do
     echo -e "\n${CYAN}=== Caddy 菜单 ===${NC}"
     echo "1) 安装 Caddy"
-    echo "2) 一键反代配置"
-    echo "3) 查看 Caddy 状态"
-    echo "4) 查看 Caddy 日志"
-    echo "5) 卸载 Caddy"
+    echo "2) 启动 Caddy"
+    echo "3) 停止 Caddy"
+    echo "4) 重启 Caddy"
+    echo "5) 重载配置"
+    echo "6) 一键反代配置"
+    echo "7) 查看 Caddy 状态"
+    echo "8) 查看 Caddy 日志"
+    echo "9) 卸载 Caddy"
     echo "0) 返回主菜单"
-    read -p "请选择 [0-5]: " caddy_choice
+    read -p "请选择 [0-9]: " caddy_choice
     
     case $caddy_choice in
       1) install_caddy ;;
-      2) caddy_reverse_proxy ;;
-      3) 
+      2) start_caddy ;;
+      3) stop_caddy ;;
+      4) restart_caddy ;;
+      5) reload_caddy ;;
+      6) caddy_reverse_proxy ;;
+      7) 
         if is_cmd systemctl; then
           systemctl status caddy 2>/dev/null || echo "Caddy 未运行"
         else
-          echo "Caddy 状态: $(ps aux | grep caddy | grep -v grep || echo '未运行')"
+          echo "Caddy 状态:"
+          if pgrep -x "caddy" >/dev/null; then
+            echo "运行中 (PID: $(pgrep -x caddy))"
+            echo "进程信息:"
+            ps aux | grep caddy | grep -v grep
+          else
+            echo "未运行"
+          fi
         fi
         ;;
-      4) 
+      8) 
         if is_cmd journalctl; then
-          journalctl -u caddy -f 2>/dev/null || echo "无法查看日志"
+          echo "1) 查看实时日志"
+          echo "2) 查看最近日志"
+          echo "3) 查看错误日志"
+          read -p "请选择 [1-3]: " log_choice
+          case $log_choice in
+            1) journalctl -u caddy -f 2>/dev/null || echo "无法查看日志" ;;
+            2) journalctl -u caddy --no-pager -n 50 2>/dev/null || echo "无法查看日志" ;;
+            3) journalctl -u caddy --no-pager -p err 2>/dev/null || echo "无法查看日志" ;;
+            *) echo "无效选择" ;;
+          esac
+        elif [ -f "/var/log/caddy.log" ]; then
+          echo "1) 查看实时日志"
+          echo "2) 查看最近日志"
+          read -p "请选择 [1-2]: " log_choice
+          case $log_choice in
+            1) tail -f /var/log/caddy.log ;;
+            2) tail -n 100 /var/log/caddy.log ;;
+            *) echo "无效选择" ;;
+          esac
         else
-          echo "无法查看 systemd 日志"
+          echo "无法找到 Caddy 日志文件"
         fi
         ;;
-      5) uninstall_caddy ;;
+      9) uninstall_caddy ;;
       0) break ;;
       *) log_error "无效选择！" ;;
     esac
